@@ -2,7 +2,6 @@
 #include <libutils/misc.h>
 
 #include <libbase/timer.h>
-#include <libbase/fast_random.h>
 #include <libgpu/vulkan/engine.h>
 #include <libgpu/vulkan/tests/test_utils.h>
 
@@ -10,6 +9,7 @@
 #include "kernels/kernels.h"
 
 #include <limits>
+#include <random>
 
 void runMergeSort(ocl::KernelSource& local_sort, ocl::KernelSource& partition,
                   ocl::KernelSource& merge, const gpu::gpu_mem_32u& input,
@@ -44,15 +44,34 @@ void runMergeSort(ocl::KernelSource& local_sort, ocl::KernelSource& partition,
     }
 }
 
+unsigned int parsePositive(const char* text)
+{
+    std::string value(text);
+    if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+        throw std::invalid_argument("Expected a positive integer");
+    }
+    unsigned long long parsed = std::stoull(value);
+    if (parsed == 0 || parsed > std::numeric_limits<unsigned int>::max()) {
+        throw std::invalid_argument("Expected an integer in [1, UINT_MAX]");
+    }
+    return static_cast<unsigned int>(parsed);
+}
+
 void run(int argc, char** argv)
 {
+    if (argc > 4) {
+        throw std::invalid_argument("Usage: main_merge_sort [device [n [iterations]]]");
+    }
+    unsigned int n = argc > 2 ? parsePositive(argv[2]) : 100*1000*1000;
+    unsigned int iterations = argc > 3 ? parsePositive(argv[3]) : 10;
+
     // chooseGPUVkDevices:
     // - Если не доступо ни одного устройства - кинет ошибку
     // - Если доступно ровно одно устройство - вернет это устройство
     // - Если доступно N>1 устройства:
     //   - Если аргументов запуска нет или переданное число не находится в диапазоне от 0 до N-1 - кинет ошибку
     //   - Если аргумент запуска есть и он от 0 до N-1 - вернет устройство под указанным номером
-    gpu::Device device = gpu::chooseGPUDevice(gpu::selectAllDevices(ALL_GPUS, true), argc, argv);
+    gpu::Device device = gpu::chooseGPUDevice(gpu::selectAllDevices(ALL_GPUS, true), std::min(argc, 2), argv);
 
     gpu::Context context = activateContext(device, gpu::Context::TypeOpenCL);
 
@@ -60,32 +79,16 @@ void run(int argc, char** argv)
     ocl::KernelSource partition(ocl::getMergeSort02Partition());
     ocl::KernelSource merge(ocl::getMergeSort03Merge());
 
-    FastRandom r;
-
-    int n = 100*1000*1000; // TODO при отладке используйте минимальное n (например n=5 или n=10) при котором воспроизводится бага
-    int min_value = 1; // это сделано для упрощения, чтобы существовало очевидное -INFINITY значение
-    int max_value = std::numeric_limits<int>::max() - 1; // TODO при отладке используйте минимальное max_value (например max_value=8) при котором воспроизводится бага
+    std::mt19937 r(42);
     std::vector<unsigned int> as(n, 0);
     std::vector<unsigned int> sorted(n, 0);
     for (size_t i = 0; i < n; ++i) {
-        as[i] = r.next(min_value, max_value);
+        as[i] = r();
     }
-    std::cout << "n=" << n << " values in range [" << min_value << "; " << max_value << "]" << std::endl;
-
-    {
-        // убедимся что в массиве есть хотя бы несколько повторяющихся значений
-        size_t force_duplicates_attempts = 3;
-        bool all_attempts_missed = true;
-        for (size_t k = 0; k < force_duplicates_attempts; ++k) {
-            size_t i = r.next(0, n - 1);
-            size_t j = r.next(0, n - 1);
-            if (i != j) {
-                as[j] = as[i];
-                all_attempts_missed = false;
-            }
-        }
-        rassert(!all_attempts_missed, 4353245123412);
+    if (n > 1) {
+        as[1] = as[0];
     }
+    std::cout << "n=" << n << " values in range [0; " << std::numeric_limits<unsigned int>::max() << "]" << std::endl;
 
     {
         sorted = as;
@@ -109,12 +112,14 @@ void run(int argc, char** argv)
     input_gpu.writeN(as.data(), n);
     // Запускаем кернел (несколько раз и с замером времени выполнения)
     std::vector<double> times;
-    for (int iter = 0; iter < 10; ++iter) { // TODO при отладке запускайте одну итерацию
+    for (uint64_t iter = 0; iter <= iterations; ++iter) {
         timer t;
 
         runMergeSort(local_sort, partition, merge, input_gpu, buffer_output_gpu, scratch_gpu, partitions_gpu, n);
 
-        times.push_back(t.elapsed());
+        if (iter > 0) {
+            times.push_back(t.elapsed());
+        }
     }
     std::cout << "GPU merge-sort times (in seconds) - " << stats::valuesStatsLine(times) << std::endl;
 
@@ -135,6 +140,7 @@ void run(int argc, char** argv)
     for (size_t i = 0; i < n; ++i) {
         rassert(input_values[i] == as[i], 6573452432, input_values[i], as[i]);
     }
+    std::cout << "Verification passed: sorted output and unchanged input" << std::endl;
 }
 
 int main(int argc, char** argv)
@@ -144,16 +150,7 @@ int main(int argc, char** argv)
         run(argc, argv);
     } catch (std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
-        if (e.what() == DEVICE_NOT_SUPPORT_API) {
-            // Возвращаем exit code = 0 чтобы на CI не было красного крестика о неуспешном запуске из-за выбора CUDA API (его нет на процессоре - т.е. в случае CI на GitHub Actions)
-            exit_code = 0;
-        } else if (e.what() == CODE_IS_NOT_IMPLEMENTED) {
-            // Возвращаем exit code = 0 чтобы на CI не было красного крестика о неуспешном запуске из-за того что задание еще не выполнено
-            exit_code = 0;
-        } else {
-            // Выставляем ненулевой exit code, чтобы сообщить, что случилась ошибка
-            exit_code = 1;
-        }
+        exit_code = 1;
     }
 
     // we need to gracefully clear Vulkan context before it is too late (otherwise we encounter segfault on some systems)
